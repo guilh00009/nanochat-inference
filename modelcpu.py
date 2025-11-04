@@ -1,4 +1,4 @@
-"""Nanochat model implementation and inference utilities (GPU-only)."""
+"""Nanochat model implementation and inference utilities (GPU + CPU offload)."""
 
 from __future__ import annotations
 
@@ -148,7 +148,7 @@ class Block(nn.Module):
 
 
 # --------------------
-# GPT with rotary (GPU-only forward)
+# GPT with rotary
 # --------------------
 
 class GPT(nn.Module):
@@ -218,24 +218,46 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         kv_cache: object | None = None,
+        *,
+        offload: bool = False,
+        run_device: torch.device | str = "cpu",
     ) -> torch.Tensor:
-        """Forward pass assuming the entire model and inputs are on CUDA."""
+        """Forward pass.
+
+        When offload=True, each block is moved to `run_device` for its step and then
+        returned to CPU to save VRAM.
+        """
         _b, t = idx.size()
         assert self.cos.size(1) >= t
         t0 = 0 if kv_cache is None else kv_cache.get_pos()
+        # ensure trig buffers are on the right device for the step
+        if offload:
+            cos_sin = (
+                self.cos[:, t0:t0 + t].to(run_device, non_blocking=True),
+                self.sin[:, t0:t0 + t].to(run_device, non_blocking=True),
+            )
+        else:
+            cos_sin = self.cos[:, t0:t0 + t], self.sin[:, t0:t0 + t]
 
-        # rotary buffers already live on CUDA
-        cos_sin = self.cos[:, t0:t0 + t], self.sin[:, t0:t0 + t]
-
-        x = self.transformer.wte(idx)
+        x = self.transformer.wte(idx.to(self.transformer.wte.weight.device))
         x = x.to(dtype=self.dtype)
         x = norm(x)
 
-        for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+        if offload:
+            # stream each block onto GPU, compute, move back
+            for block in self.transformer.h:
+                block.to(run_device, dtype=self.dtype, non_blocking=True)
+                x = x.to(run_device, non_blocking=True)
+                x = block(x, cos_sin, kv_cache)
+                x = x.to("cpu", non_blocking=True)
+                block.to("cpu", dtype=self.dtype, non_blocking=True)
+                torch.cuda.empty_cache()
+        else:
+            for block in self.transformer.h:
+                x = block(x, cos_sin, kv_cache)
 
         x = norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x.to(self.lm_head.weight.device))
         softcap = 15
         return softcap * torch.tanh(logits / softcap)
 
@@ -245,22 +267,26 @@ class GPT(nn.Module):
 # --------------------
 
 class NanochatModel:
-    """Loads weights and runs inference; forces full-GPU execution."""
+    """Loads weights and runs inference; prefers GPU with CPU offload fallback."""
 
-    def __init__(self, model_dir: str, device: str = "cuda", offload: bool | None = False) -> None:
+    def __init__(self, model_dir: str, device: str = "auto", offload: bool | None = None) -> None:
         """
         Args:
             model_dir: Directory containing model files.
-            device: Must be "cuda" (GPU-only).
-            offload: Ignored; always False in GPU-only mode.
+            device: "auto" (default), "cuda", or "cpu".
+            offload: If True, keep blocks on CPU and stream them to GPU each step.
+                     If None, auto-enable when using CUDA and total VRAM is limited (~<=6-8GB).
         """
         # Choose device and dtype
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available but GPU-only mode was requested.")
-        self.device = torch.device("cuda")
-        
-        # hard-disable offload in GPU-only mode
-        self.offload = False
+        use_cuda = torch.cuda.is_available() and (device in ("auto", "cuda"))
+        self.device = torch.device("cuda") if use_cuda else torch.device("cpu")
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.bfloat16
+
+        # sensible defaults for small-VRAM GPUs
+        if offload is None:
+            self.offload = self.device.type == "cuda"
+        else:
+            self.offload = bool(offload)
 
         # perf knobs
         try:
@@ -270,14 +296,13 @@ class NanochatModel:
             pass
 
         self.model_dir = model_dir
-        # Load model first to detect its native dtype
-        self.model, self.dtype = self._load_model()
+        self.model = self._load_model()
         self.enc = self._load_tokenizer()
         self._setup_special_tokens()
 
     # ---- weight / tokenizer loading ----
 
-    def _load_model(self) -> tuple[GPT, torch.dtype]:
+    def _load_model(self) -> GPT:
         model_dir_path = Path(self.model_dir)
         model_files = list(model_dir_path.glob("model_*.pt"))
         if not model_files:
@@ -295,43 +320,41 @@ class NanochatModel:
         model_config_kwargs = meta["model_config"]
         model_config = GPTConfig(**model_config_kwargs)
 
-        # Load a sample weight to detect original dtype
-        print(f"Detecting model dtype from {model_file}...")
-        sample_weights = torch.load(model_file, map_location="cpu", weights_only=True)
-        first_weight = next(iter(sample_weights.values()))
-        original_dtype = first_weight.dtype
-        print(f"Model original dtype: {original_dtype}")
-        del sample_weights  # Free memory
-        
-        # Use original dtype
-        dtype = original_dtype
-
-        # build empty model on META
+        # build empty model on CPU to control placement manually
         with torch.device("meta"):
-            model = GPT(model_config, dtype=dtype)
+            model = GPT(model_config, dtype=self.dtype)
 
-        # Load weights directly to GPU in original precision
-        print(f"Loading weights directly to GPU in {dtype}...")
-        weights = torch.load(model_file, map_location=self.device, weights_only=True)
+        # load weights
+        weights = torch.load(model_file, map_location="cpu", weights_only=True)
         weights = {k.removeprefix("_orig_mod."): v for k, v in weights.items()}
 
-        # Keep weights in their original dtype - no conversion
-        print(f"Keeping weights in original precision ({dtype})")
+        # cast to target dtype (fp16 on GPU; bf16 on CPU if available)
+        desired = self.dtype
+        weights = {k: (v.to(desired) if v.dtype != desired else v) for k, v in weights.items()}
 
-        # materialize and keep everything on CUDA
-        model.to_empty(device=self.device)
+        # materialize on CPU first (cheaper peak VRAM)
+        model.to_empty(device="cpu")
         model.init_weights()
         missing, unexpected = model.load_state_dict(weights, strict=True, assign=True)
         assert not missing and not unexpected
-        model.to(self.device, dtype=dtype, non_blocking=True)
         model.eval()
 
-        # ensure rotary buffers are on CUDA as well
-        model.cos = model.cos.to(self.device, non_blocking=True)
-        model.sin = model.sin.to(self.device, non_blocking=True)
-        
-        print("Model loaded successfully on GPU")
-        return model, dtype
+        if not self.offload and self.device.type == "cuda":
+            # put full model on GPU if we are NOT offloading
+            model.to(self.device, dtype=self.dtype, non_blocking=True)
+        else:
+            # offload mode: keep blocks on CPU; small bits to CPU already
+            model.to("cpu", dtype=self.dtype)
+
+            # optional: keep embedding & head on GPU to save transfers
+            if self.device.type == "cuda":
+                model.transformer.wte.to(self.device, dtype=self.dtype, non_blocking=True)
+                model.lm_head.to(self.device, dtype=self.dtype, non_blocking=True)
+
+        # keep rotary buffers on CPU; we'll move slices to GPU per step when offloading
+        model.cos = model.cos.to("cpu")
+        model.sin = model.sin.to("cpu")
+        return model
 
     def _load_tokenizer(self) -> object:
         tokenizer_path = Path(self.model_dir) / "tokenizer.pkl"
@@ -379,7 +402,7 @@ class NanochatModel:
         tokens.append(self.assistant_start_id)
         return tokens
 
-    # ---- generation (GPU-only) ----
+    # ---- generation ----
 
     def generate(
         self,
@@ -396,38 +419,45 @@ class NanochatModel:
         else:
             raise ValueError("Either prompt or history must be provided")
 
-        # create input directly on CUDA
-        x = torch.tensor([input_ids], dtype=torch.long, device=self.device)
-        
-        # Run in native model precision (no autocast)
-        with torch.inference_mode():
+        # start the context on CPU to reduce peak VRAM; move to GPU only when needed
+        x = torch.tensor([input_ids], dtype=torch.long, device="cpu")
+
+        use_cuda = self.device.type == "cuda"
+        autocast_ctx = (
+            torch.cuda.amp.autocast(dtype=self.dtype) if use_cuda else torch.cpu.amp.autocast(dtype=self.dtype)
+        )
+
+        with torch.inference_mode(), autocast_ctx:
             for _ in range(max_tokens):
-                logits = self.model(x, kv_cache=None)
+                if self.offload and use_cuda:
+                    # idx lives on CPU until we run; model.forward will stream blocks
+                    logits = self.model(
+                        x, kv_cache=None, offload=True, run_device=self.device
+                    )
+                else:
+                    # keep everything on one device
+                    x = x.to(self.device, non_blocking=True)
+                    logits = self.model(x, kv_cache=None, offload=False, run_device=self.device)
+
                 logits = logits[:, -1, :]
-                
-                # Convert to float32 only for sampling stability
-                logits = logits.float()
-                
-                # Apply temperature
                 logits = logits / max(temperature, 1e-5)
 
-                # Top-k filtering
                 if top_k > 0:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -1e10
+                    logits[logits < v[:, [-1]]] = -float("inf")
 
-                # Compute probabilities in fp32
                 probs = F.softmax(logits, dim=-1)
-                
-                # Sample token
                 next_token = torch.multinomial(probs, num_samples=1)
 
-                token_id = int(next_token.item())
-                
-                if token_id in self.stop_tokens:
+                if int(next_token.item()) in self.stop_tokens:
                     break
 
-                token_str = self.enc.decode([token_id])
+                token_str = self.enc.decode([int(next_token.item())])
                 yield token_str
 
-                x = torch.cat([x, next_token], dim=1)
+                # keep the running sequence on CPU in offload mode to avoid VRAM growth
+                if self.offload and use_cuda:
+                    x = torch.cat([x, next_token.to("cpu")], dim=1)
+                    torch.cuda.empty_cache()
+                else:
+                    x = torch.cat([x, next_token], dim=1)
