@@ -13,6 +13,7 @@ hf_oauth_scopes:
 license: mit
 ---
 
-A lightweight chatbot powered by [nanochat](https://huggingface.co/sdobson/nanochat), a small GPT-based language model trained in 4 hours for $100. The model runs on CPU using PyTorch for fast, private inference.
+A lightweight chatbot,
 
 Built with [Gradio](https://gradio.app) for the interface and [`huggingface_hub`](https://huggingface.co/docs/huggingface_hub/v0.22.2/en/index) for model distribution.
+
