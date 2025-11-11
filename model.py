@@ -1,4 +1,4 @@
-"""Nanochat model implementation and inference utilities (GPU-only)."""
+"""Nanochat model implementation and inference utilities (Multi-GPU support)."""
 
 from __future__ import annotations
 
@@ -29,6 +29,26 @@ class GPTConfig:
     n_head: int = 16
     n_kv_head: int = 16
     n_embd: int = 2048
+    
+    def __init__(self, **kwargs):
+        # Define expected fields with defaults
+        expected_fields = {
+            'sequence_len': 2048,
+            'vocab_size': 65536,
+            'n_layer': 32,
+            'n_head': 16,
+            'n_kv_head': 16,
+            'n_embd': 2048,
+        }
+        
+        # Set attributes from expected fields
+        for field, default in expected_fields.items():
+            setattr(self, field, kwargs.get(field, default))
+        
+        # Warn about unexpected parameters (optional)
+        unexpected = set(kwargs.keys()) - set(expected_fields.keys())
+        if unexpected:
+            print(f"Warning: Ignoring unexpected config parameters: {unexpected}")
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
@@ -148,7 +168,7 @@ class Block(nn.Module):
 
 
 # --------------------
-# GPT with rotary (GPU-only forward)
+# GPT with rotary (Multi-GPU forward)
 # --------------------
 
 class GPT(nn.Module):
@@ -219,13 +239,14 @@ class GPT(nn.Module):
         targets: torch.Tensor | None = None,
         kv_cache: object | None = None,
     ) -> torch.Tensor:
-        """Forward pass assuming the entire model and inputs are on CUDA."""
+        """Forward pass supporting multi-GPU execution."""
         _b, t = idx.size()
         assert self.cos.size(1) >= t
         t0 = 0 if kv_cache is None else kv_cache.get_pos()
 
-        # rotary buffers already live on CUDA
-        cos_sin = self.cos[:, t0:t0 + t], self.sin[:, t0:t0 + t]
+        # Move rotary buffers to same device as input
+        device = idx.device
+        cos_sin = self.cos[:, t0:t0 + t].to(device), self.sin[:, t0:t0 + t].to(device)
 
         x = self.transformer.wte(idx)
         x = x.to(dtype=self.dtype)
@@ -241,25 +262,149 @@ class GPT(nn.Module):
 
 
 # --------------------
+# Pipeline Parallel wrapper for layer-wise distribution
+# --------------------
+
+class PipelineParallelGPT(nn.Module):
+    """Distributes transformer layers across multiple GPUs in a pipeline."""
+    
+    def __init__(self, model: GPT, device_ids: list[int]):
+        super().__init__()
+        self.model = model
+        self.device_ids = device_ids
+        self.num_devices = len(device_ids)
+        
+        # Calculate layers per device
+        total_layers = len(model.transformer.h)
+        self.layers_per_device = total_layers // self.num_devices
+        self.remainder = total_layers % self.num_devices
+        
+        # Distribute layers across devices
+        print(f"\nDistributing {total_layers} layers across {self.num_devices} GPUs:")
+        layer_idx = 0
+        self.device_map = {}
+        
+        for device_idx, device_id in enumerate(device_ids):
+            # Give extra layers to first devices if there's a remainder
+            num_layers = self.layers_per_device + (1 if device_idx < self.remainder else 0)
+            device = torch.device(f"cuda:{device_id}")
+            
+            layer_range = list(range(layer_idx, layer_idx + num_layers))
+            print(f"  GPU {device_id}: Layers {layer_range[0]}-{layer_range[-1]} ({num_layers} layers)")
+            
+            for l_idx in layer_range:
+                self.device_map[l_idx] = device
+                model.transformer.h[l_idx].to(device)
+            
+            layer_idx += num_layers
+        
+        # Place embedding and lm_head on first and last device
+        self.first_device = torch.device(f"cuda:{device_ids[0]}")
+        self.last_device = torch.device(f"cuda:{device_ids[-1]}")
+        
+        print(f"  Embedding on GPU {device_ids[0]}")
+        print(f"  LM head on GPU {device_ids[-1]}")
+        
+        model.transformer.wte.to(self.first_device)
+        model.lm_head.to(self.last_device)
+        
+        # Place rotary embeddings on first device
+        model.cos = model.cos.to(self.first_device)
+        model.sin = model.sin.to(self.first_device)
+    
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        kv_cache: object | None = None,
+    ) -> torch.Tensor:
+        """Forward pass with pipeline parallelism."""
+        _b, t = idx.size()
+        assert self.model.cos.size(1) >= t
+        t0 = 0 if kv_cache is None else kv_cache.get_pos()
+        
+        # Start on first device
+        x = idx.to(self.first_device)
+        
+        # Get rotary embeddings (already on first device)
+        cos_sin = (
+            self.model.cos[:, t0:t0 + t],
+            self.model.sin[:, t0:t0 + t]
+        )
+        
+        # Embedding
+        x = self.model.transformer.wte(x)
+        x = x.to(dtype=self.model.dtype)
+        x = norm(x)
+        
+        # Process through layers, moving between devices as needed
+        current_device = self.first_device
+        for layer_idx, block in enumerate(self.model.transformer.h):
+            target_device = self.device_map[layer_idx]
+            
+            # Move to new device if needed
+            if target_device != current_device:
+                x = x.to(target_device)
+                # Move rotary embeddings to target device
+                cos_sin = (cos_sin[0].to(target_device), cos_sin[1].to(target_device))
+                current_device = target_device
+            
+            x = block(x, cos_sin, kv_cache)
+        
+        # Move to last device for final processing
+        if current_device != self.last_device:
+            x = x.to(self.last_device)
+        
+        x = norm(x)
+        logits = self.model.lm_head(x)
+        softcap = 15
+        return softcap * torch.tanh(logits / softcap)
+
+
+# --------------------
 # Inference wrapper
 # --------------------
 
 class NanochatModel:
-    """Loads weights and runs inference; forces full-GPU execution."""
+    """Loads weights and runs inference with multi-GPU support."""
 
-    def __init__(self, model_dir: str, device: str = "cuda", offload: bool | None = False) -> None:
+    def __init__(
+        self, 
+        model_dir: str, 
+        device: str = "cuda", 
+        offload: bool | None = False,
+        num_gpus: int | None = None
+    ) -> None:
         """
         Args:
             model_dir: Directory containing model files.
-            device: Must be "cuda" (GPU-only).
-            offload: Ignored; always False in GPU-only mode.
+            device: Device to use ("cuda" for multi-GPU).
+            offload: Ignored; always False in GPU mode.
+            num_gpus: Number of GPUs to use. If None, uses all available GPUs.
         """
-        # Choose device and dtype
+        # Check CUDA availability
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available but GPU-only mode was requested.")
-        self.device = torch.device("cuda")
+            raise RuntimeError("CUDA is not available but GPU mode was requested.")
         
-        # hard-disable offload in GPU-only mode
+        # Determine number of GPUs
+        available_gpus = torch.cuda.device_count()
+        if num_gpus is None:
+            self.num_gpus = available_gpus
+        else:
+            self.num_gpus = min(num_gpus, available_gpus)
+        
+        if self.num_gpus == 0:
+            raise RuntimeError("No GPUs available")
+        
+        print(f"Using {self.num_gpus} GPU(s) out of {available_gpus} available")
+        
+        # Primary device (GPU 0)
+        self.device = torch.device("cuda:0")
+        
+        # List of all GPU devices to use
+        self.device_ids = list(range(self.num_gpus))
+        
+        # hard-disable offload in GPU mode
         self.offload = False
 
         # perf knobs
@@ -270,14 +415,14 @@ class NanochatModel:
             pass
 
         self.model_dir = model_dir
-        # Load model first to detect its native dtype
+        # Load model with multi-GPU support
         self.model, self.dtype = self._load_model()
         self.enc = self._load_tokenizer()
         self._setup_special_tokens()
 
     # ---- weight / tokenizer loading ----
 
-    def _load_model(self) -> tuple[GPT, torch.dtype]:
+    def _load_model(self) -> tuple[nn.Module, torch.dtype]:
         model_dir_path = Path(self.model_dir)
         model_files = list(model_dir_path.glob("model_*.pt"))
         if not model_files:
@@ -295,7 +440,7 @@ class NanochatModel:
         model_config_kwargs = meta["model_config"]
         model_config = GPTConfig(**model_config_kwargs)
 
-        # Load a sample weight to detect original dtype
+        # Load a sample weight to detect original dtype (load to CPU to avoid OOM)
         print(f"Detecting model dtype from {model_file}...")
         sample_weights = torch.load(model_file, map_location="cpu", weights_only=True)
         first_weight = next(iter(sample_weights.values()))
@@ -306,31 +451,42 @@ class NanochatModel:
         # Use original dtype
         dtype = original_dtype
 
-        # build empty model on META
+        # Build empty model on META (no memory allocated)
+        print("Building model architecture on meta device...")
         with torch.device("meta"):
             model = GPT(model_config, dtype=dtype)
 
-        # Load weights directly to GPU in original precision
-        print(f"Loading weights directly to GPU in {dtype}...")
-        weights = torch.load(model_file, map_location=self.device, weights_only=True)
+        # Load weights directly to CPU first
+        print(f"Loading weights from disk...")
+        weights = torch.load(model_file, map_location="cpu", weights_only=True)
         weights = {k.removeprefix("_orig_mod."): v for k, v in weights.items()}
 
-        # Keep weights in their original dtype - no conversion
-        print(f"Keeping weights in original precision ({dtype})")
-
-        # materialize and keep everything on CUDA
-        model.to_empty(device=self.device)
-        model.init_weights()
-        missing, unexpected = model.load_state_dict(weights, strict=True, assign=True)
-        assert not missing and not unexpected
-        model.to(self.device, dtype=dtype, non_blocking=True)
-        model.eval()
-
-        # ensure rotary buffers are on CUDA as well
-        model.cos = model.cos.to(self.device, non_blocking=True)
-        model.sin = model.sin.to(self.device, non_blocking=True)
+        # If single GPU, load normally
+        if self.num_gpus == 1:
+            print(f"Loading to single GPU (cuda:0)...")
+            model.to_empty(device=self.device)
+            model.init_weights()
+            model.load_state_dict(weights, strict=True, assign=True)
+            model.to(self.device, dtype=dtype, non_blocking=True)
+            model.cos = model.cos.to(self.device, non_blocking=True)
+            model.sin = model.sin.to(self.device, non_blocking=True)
+            model.eval()
+            print("Model loaded successfully on single GPU")
+            return model, dtype
         
-        print("Model loaded successfully on GPU")
+        # Multi-GPU: Load weights distributed across devices
+        print(f"Distributing model across {self.num_gpus} GPUs...")
+        
+        # Materialize model on CPU first
+        model.to_empty(device="cpu")
+        model.init_weights()
+        model.load_state_dict(weights, strict=True, assign=True)
+        
+        # Wrap with pipeline parallel (this moves layers to different GPUs)
+        model = PipelineParallelGPT(model, self.device_ids)
+        model.eval()
+        
+        print("Model loaded successfully across multiple GPUs")
         return model, dtype
 
     def _load_tokenizer(self) -> object:
@@ -379,7 +535,7 @@ class NanochatModel:
         tokens.append(self.assistant_start_id)
         return tokens
 
-    # ---- generation (GPU-only) ----
+    # ---- generation (Multi-GPU) ----
 
     def generate(
         self,
@@ -396,7 +552,7 @@ class NanochatModel:
         else:
             raise ValueError("Either prompt or history must be provided")
 
-        # create input directly on CUDA
+        # create input on primary GPU
         x = torch.tensor([input_ids], dtype=torch.long, device=self.device)
         
         # Run in native model precision (no autocast)
@@ -430,4 +586,6 @@ class NanochatModel:
                 token_str = self.enc.decode([token_id])
                 yield token_str
 
+                # Move next_token to same device as x before concatenating
+                next_token = next_token.to(x.device)
                 x = torch.cat([x, next_token], dim=1)
